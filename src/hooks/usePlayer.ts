@@ -19,7 +19,10 @@ const DEFAULT_STATE: PlayerState = {
 
 function hexToBase64url(hex: string): string {
   try {
-    const bytes = new Uint8Array(hex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+    const clean = hex.replace(/\s/g, '');
+    const bytes = new Uint8Array(
+      clean.match(/.{1,2}/g)!.map(b => parseInt(b, 16))
+    );
     const b64 = btoa(String.fromCharCode(...Array.from(bytes)));
     return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   } catch {
@@ -28,9 +31,12 @@ function hexToBase64url(hex: string): string {
 }
 
 /**
- * Build the proxied URL for a channel's stream.
- * The server proxy injects Cookie/User-Agent/Referer/Origin when fetching upstream.
- * For HLS, the server also rewrites segment URLs so all segments go through the proxy.
+ * Build the proxied manifest URL for a channel.
+ * The server proxy:
+ *   - Injects Cookie / User-Agent / Referer / Origin when fetching the manifest
+ *   - For HLS: rewrites ALL segment and key URLs to go through /api/proxy/segment
+ *   - For DASH/MPD: rewrites ALL BaseURL / initialization / media URLs similarly
+ * So DASH.js and HLS.js only ever talk to our proxy — never to the CDN directly.
  */
 function buildChannelProxyUrl(channel: Channel): string {
   return buildProxyStreamUrl({
@@ -55,7 +61,7 @@ export function usePlayer() {
 
   const destroyPlayers = useCallback(() => {
     if (hlsRef.current) {
-      hlsRef.current.destroy();
+      try { hlsRef.current.destroy(); } catch { /* ignore */ }
       hlsRef.current = null;
     }
     if (dashRef.current) {
@@ -67,7 +73,7 @@ export function usePlayer() {
     }
   }, []);
 
-  // ── DASH.js loader ─────────────────────────────────────────────────────────
+  // ── DASH.js ─────────────────────────────────────────────────────────────────
   const loadDashStream = useCallback(async (channel: Channel, video: HTMLVideoElement) => {
     try {
       const dashjs = await import('dashjs');
@@ -76,11 +82,12 @@ export function usePlayer() {
 
       player.initialize(video, undefined, false);
 
-      // ClearKey DRM
+      // ClearKey DRM — convert hex keyId/key to Base64url for the EME API
       if (channel.clearKey?.keyId && channel.clearKey?.key) {
         const keyIdB64 = hexToBase64url(channel.clearKey.keyId);
         const keyB64 = hexToBase64url(channel.clearKey.key);
         if (keyIdB64 && keyB64) {
+          console.log('[DASH] Setting ClearKey DRM', { keyIdB64, keyB64 });
           player.setProtectionData({
             'org.w3.clearkey': {
               clearkeys: { [keyIdB64]: keyB64 },
@@ -92,28 +99,55 @@ export function usePlayer() {
       player.updateSettings({
         streaming: {
           lowLatencyEnabled: false,
+          retryAttempts: {
+            MPD: 3,
+            XLinkExpansion: 1,
+            InitializationSegment: 3,
+            BitstreamSwitchingSegment: 3,
+            IndexSegment: 3,
+            MediaSegment: 3,
+            FragmentInfoSegment: 3,
+          },
+          retryIntervals: {
+            MPD: 500,
+            MediaSegment: 1000,
+            InitializationSegment: 1000,
+          },
           abr: { autoSwitchBitrate: { video: true, audio: true } },
           manifestUpdateRetryAttempts: 3,
+          gaps: { jumpGaps: true, jumpLargeGaps: true },
         },
         debug: { logLevel: 0 },
       });
 
-      // For DASH, we route the manifest through our proxy.
-      // Segments are handled by DASH.js internally; since our proxy
-      // rewrites the MPD's base URLs (future enhancement), or we rely on
-      // the server rewriting segment URLs within MPD responses.
-      // For now, use the proxied manifest URL — cookies/headers are applied
-      // by the server when fetching the MPD and its referenced media.
+      // The proxy URL: server fetches the MPD and rewrites ALL segment URLs
+      // inside it to go through /api/proxy/segment with the correct auth headers.
+      // DASH.js then fetches those rewritten URLs — all going through our proxy.
       const proxyUrl = buildChannelProxyUrl(channel);
+      console.log('[DASH] Loading via proxy:', proxyUrl.substring(0, 120));
       player.attachSource(proxyUrl);
       player.play();
 
       const events = (dashjs.MediaPlayer as any).events;
 
       player.on(events.ERROR, (e: any) => {
-        const detail = e?.error?.message || e?.error?.code || JSON.stringify(e?.error ?? e);
-        console.error('[DASH] Error:', e);
-        updateState({ error: `Stream error: ${detail}`, isLoading: false });
+        const code = e?.error?.code;
+        const msg = e?.error?.message || e?.error?.data?.message || '';
+        console.error('[DASH] Error event:', e);
+
+        // Ignore non-fatal protection/DRM init errors that DASH.js self-recovers
+        if (code === 'mediaKeySystemAccess' && !msg) return;
+
+        let friendly = `DASH error (${code ?? 'unknown'})`;
+        if (msg) friendly += `: ${msg}`;
+        if (code === 27 || msg.includes('403'))
+          friendly = 'Stream token expired (HTTP 403). Wait for the M3U to refresh (every 6h).';
+        else if (code === 25 || msg.includes('404'))
+          friendly = 'Stream not found (HTTP 404). Channel may be offline.';
+        else if (msg.includes('network') || code === 1)
+          friendly = 'Network error fetching stream. Check your connection.';
+
+        updateState({ error: friendly, isLoading: false });
       });
 
       player.on(events.STREAM_INITIALIZED, () => {
@@ -132,28 +166,34 @@ export function usePlayer() {
         } catch { /* no video tracks */ }
       });
 
-      player.on(events.PLAYBACK_STARTED, () => updateState({ isPlaying: true, isLoading: false, error: null }));
+      player.on(events.PLAYBACK_STARTED, () =>
+        updateState({ isPlaying: true, isLoading: false, error: null })
+      );
       player.on(events.PLAYBACK_PAUSED, () => updateState({ isPlaying: false }));
       player.on(events.BUFFER_EMPTY, () => updateState({ isLoading: true }));
       player.on(events.BUFFER_LOADED, () => updateState({ isLoading: false }));
-      player.on(events.MANIFEST_LOADED, () => updateState({ isLoading: false }));
-
+      player.on(events.MANIFEST_LOADED, () => {
+        console.log('[DASH] Manifest loaded');
+        updateState({ isLoading: false, error: null });
+      });
+      player.on(events.PLAYBACK_ERROR, (e: any) => {
+        console.error('[DASH] Playback error:', e);
+        updateState({ error: `Playback error: ${e?.error ?? 'unknown'}`, isLoading: false });
+      });
     } catch (err) {
       console.error('[DASH] Init error:', err);
       updateState({
-        error: `Failed to initialize DASH player: ${err instanceof Error ? err.message : err}`,
+        error: `DASH player init failed: ${err instanceof Error ? err.message : err}`,
         isLoading: false,
       });
     }
   }, [updateState]);
 
-  // ── HLS.js loader ──────────────────────────────────────────────────────────
+  // ── HLS.js ──────────────────────────────────────────────────────────────────
   const loadHLSStream = useCallback((channel: Channel, video: HTMLVideoElement) => {
     if (Hls.isSupported()) {
-      // The proxy URL: our server fetches the HLS manifest and rewrites all
-      // segment/key URLs to go through /api/proxy/segment and /api/proxy/key.
-      // This means Cookie/User-Agent are injected server-side for EVERY request.
       const proxyUrl = buildChannelProxyUrl(channel);
+      console.log('[HLS] Loading via proxy:', proxyUrl.substring(0, 120));
 
       const hls = new Hls({
         enableWorker: true,
@@ -161,8 +201,11 @@ export function usePlayer() {
         backBufferLength: 90,
         maxBufferLength: 60,
         maxMaxBufferLength: 120,
-        // Since segments are already proxied via URL rewriting in the manifest,
-        // no xhrSetup header injection needed here.
+        fragLoadingMaxRetry: 4,
+        manifestLoadingMaxRetry: 3,
+        levelLoadingMaxRetry: 4,
+        fragLoadingRetryDelay: 1000,
+        manifestLoadingRetryDelay: 1000,
       });
 
       hlsRef.current = hls;
@@ -172,7 +215,11 @@ export function usePlayer() {
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
         const qualities: QualityLevel[] = data.levels.map((l, idx) => ({
           id: idx,
-          label: l.height ? `${l.height}p` : l.bitrate ? `${Math.round(l.bitrate / 1000)}kbps` : `Level ${idx}`,
+          label: l.height
+            ? `${l.height}p`
+            : l.bitrate
+              ? `${Math.round(l.bitrate / 1000)}kbps`
+              : `Level ${idx}`,
           height: l.height || 0,
           bitrate: l.bitrate || 0,
         }));
@@ -180,43 +227,48 @@ export function usePlayer() {
         video.play().catch(e => console.warn('[HLS] Autoplay blocked:', e));
       });
 
-      let networkErrors = 0;
-      let mediaErrors = 0;
+      let networkRetries = 0;
+      let mediaRetries = 0;
 
       hls.on(Hls.Events.ERROR, (_, data) => {
-        console.warn('[HLS] Error:', data.type, data.details, data.fatal);
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              networkErrors++;
-              if (networkErrors <= 3) {
-                console.log('[HLS] Network error, retrying…');
-                setTimeout(() => hls.startLoad(), 1500 * networkErrors);
-              } else {
-                updateState({
-                  error: `Network error: ${data.details}. The stream may have expired or be unavailable.`,
-                  isLoading: false,
-                });
-              }
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              mediaErrors++;
-              if (mediaErrors <= 2) {
-                console.log('[HLS] Media error, recovering…');
-                hls.recoverMediaError();
-              } else {
-                updateState({
-                  error: `Media error: ${data.details}. Try selecting the channel again.`,
-                  isLoading: false,
-                });
-              }
-              break;
-            default:
+        console.warn('[HLS] Error:', data.type, data.details, 'fatal:', data.fatal);
+        if (!data.fatal) return;
+
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            networkRetries++;
+            if (networkRetries <= 4) {
+              const delay = 1000 * networkRetries;
+              console.log(`[HLS] Network error — retry ${networkRetries} in ${delay}ms`);
+              setTimeout(() => {
+                try { hls.startLoad(); } catch { /* ignore if destroyed */ }
+              }, delay);
+            } else {
               updateState({
-                error: `Fatal stream error: ${data.details}`,
+                error: `Network error: ${data.details}. The stream token may have expired (tokens refresh every 6h).`,
                 isLoading: false,
               });
-          }
+            }
+            break;
+
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            mediaRetries++;
+            if (mediaRetries <= 3) {
+              console.log(`[HLS] Media error — recovering (attempt ${mediaRetries})`);
+              hls.recoverMediaError();
+            } else {
+              updateState({
+                error: `Media decode error: ${data.details}. Try reloading the channel.`,
+                isLoading: false,
+              });
+            }
+            break;
+
+          default:
+            updateState({
+              error: `Stream error: ${data.details}`,
+              isLoading: false,
+            });
         }
       });
 
@@ -233,72 +285,75 @@ export function usePlayer() {
       });
 
       hls.on(Hls.Events.FRAG_BUFFERED, () => updateState({ isLoading: false }));
-
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS (Safari / iOS) — use proxied URL
+      // Native HLS (Safari/iOS)
       const proxyUrl = buildChannelProxyUrl(channel);
+      console.log('[HLS/Native] Loading:', proxyUrl.substring(0, 120));
       video.src = proxyUrl;
       updateState({ isLoading: false });
-      video.addEventListener('loadedmetadata', () => {
-        video.play().catch(e => console.warn('[Native HLS] Autoplay blocked:', e));
-      }, { once: true });
+      video.addEventListener(
+        'loadedmetadata',
+        () => video.play().catch(e => console.warn('[HLS/Native] Autoplay blocked:', e)),
+        { once: true }
+      );
     } else {
-      updateState({
-        error: 'HLS playback is not supported in this browser.',
-        isLoading: false,
-      });
+      updateState({ error: 'HLS playback is not supported in this browser.', isLoading: false });
     }
   }, [updateState]);
 
-  // ── Public: load channel ───────────────────────────────────────────────────
-  const loadChannel = useCallback(async (channel: Channel) => {
-    const video = videoRef.current;
-    if (!video) return;
+  // ── Load channel ─────────────────────────────────────────────────────────────
+  const loadChannel = useCallback(
+    async (channel: Channel) => {
+      const video = videoRef.current;
+      if (!video) return;
 
-    destroyPlayers();
-    setCurrentChannel(channel);
-    updateState({
-      ...DEFAULT_STATE,
-      isLoading: true,
-      volume: state.volume,
-      isMuted: state.isMuted,
-    });
-
-    video.volume = state.volume;
-    video.muted = state.isMuted;
-
-    try {
-      if (channel.streamType === 'dash' || channel.streamType === 'mpd') {
-        await loadDashStream(channel, video);
-      } else {
-        loadHLSStream(channel, video);
-      }
-    } catch (err) {
+      destroyPlayers();
+      setCurrentChannel(channel);
       updateState({
-        error: `Failed to initialize player: ${err instanceof Error ? err.message : err}`,
-        isLoading: false,
+        ...DEFAULT_STATE,
+        isLoading: true,
+        volume: state.volume,
+        isMuted: state.isMuted,
       });
-    }
-  }, [destroyPlayers, loadDashStream, loadHLSStream, updateState, state.volume, state.isMuted]);
 
+      video.volume = state.volume;
+      video.muted = state.isMuted;
+
+      try {
+        if (channel.streamType === 'dash' || channel.streamType === 'mpd') {
+          await loadDashStream(channel, video);
+        } else {
+          loadHLSStream(channel, video);
+        }
+      } catch (err) {
+        updateState({
+          error: `Failed to start player: ${err instanceof Error ? err.message : err}`,
+          isLoading: false,
+        });
+      }
+    },
+    [destroyPlayers, loadDashStream, loadHLSStream, updateState, state.volume, state.isMuted]
+  );
+
+  // ── Controls ─────────────────────────────────────────────────────────────────
   const togglePlay = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.paused ? video.play().catch(console.error) : video.pause();
+    const v = videoRef.current;
+    if (!v) return;
+    v.paused ? v.play().catch(console.error) : v.pause();
   }, []);
 
   const toggleMute = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.muted = !video.muted;
-    updateState({ isMuted: video.muted });
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = !v.muted;
+    updateState({ isMuted: v.muted });
   }, [updateState]);
 
   const setVolume = useCallback((vol: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.volume = vol;
-    video.muted = vol === 0;
+    const v = videoRef.current;
+    if (!v) return;
+    v.volume = vol;
+    v.muted = vol === 0;
     updateState({ volume: vol, isMuted: vol === 0 });
   }, [updateState]);
 
@@ -312,60 +367,63 @@ export function usePlayer() {
     }
   }, [updateState]);
 
-  const setQuality = useCallback((qualityId: number) => {
-    if (hlsRef.current) {
-      hlsRef.current.currentLevel = qualityId;
-      const lvl = qualityId === -1 ? null : hlsRef.current.levels[qualityId];
-      updateState({
-        quality: qualityId === -1 ? 'Auto' : (lvl?.height ? `${lvl.height}p` : 'Manual'),
-      });
-    } else if (dashRef.current) {
-      const dash = dashRef.current as any;
-      if (qualityId === -1) {
-        dash.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: true } } } });
-        updateState({ quality: 'Auto' });
-      } else {
-        dash.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } });
-        dash.setQualityFor('video', qualityId);
-        updateState({ quality: state.qualities[qualityId]?.label || 'Manual' });
+  const setQuality = useCallback(
+    (qualityId: number) => {
+      if (hlsRef.current) {
+        hlsRef.current.currentLevel = qualityId;
+        const lvl = qualityId === -1 ? null : hlsRef.current.levels[qualityId];
+        updateState({
+          quality: qualityId === -1 ? 'Auto' : lvl?.height ? `${lvl.height}p` : 'Manual',
+        });
+      } else if (dashRef.current) {
+        const dash = dashRef.current as any;
+        if (qualityId === -1) {
+          dash.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: true } } } });
+          updateState({ quality: 'Auto' });
+        } else {
+          dash.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } });
+          dash.setQualityFor('video', qualityId);
+          updateState({ quality: state.qualities[qualityId]?.label || 'Manual' });
+        }
       }
-    }
-  }, [state.qualities, updateState]);
+    },
+    [state.qualities, updateState]
+  );
 
-  // ── Video element event listeners ──────────────────────────────────────────
+  // ── Video element events ──────────────────────────────────────────────────────
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    const onTimeUpdate = () => {
+    const onTimeUpdate = () =>
       setState(prev => ({
         ...prev,
         currentTime: video.currentTime,
         duration: video.duration || 0,
-        buffered: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0,
+        buffered:
+          video.buffered.length > 0
+            ? video.buffered.end(video.buffered.length - 1)
+            : 0,
       }));
-    };
 
     const onPlay = () => updateState({ isPlaying: true, isLoading: false });
     const onPause = () => updateState({ isPlaying: false });
     const onWaiting = () => updateState({ isLoading: true });
     const onCanPlay = () => updateState({ isLoading: false });
-    const onVolumeChange = () => updateState({ volume: video.volume, isMuted: video.muted });
-    const onFullscreenChange = () => updateState({ isFullscreen: !!document.fullscreenElement });
+    const onVolumeChange = () =>
+      updateState({ volume: video.volume, isMuted: video.muted });
+    const onFullscreenChange = () =>
+      updateState({ isFullscreen: !!document.fullscreenElement });
     const onError = () => {
       const err = video.error;
-      if (err) {
-        const messages: Record<number, string> = {
-          1: 'Playback aborted by user',
-          2: 'Network error while loading stream',
-          3: 'Media decoding error',
-          4: 'Stream format not supported or URL expired',
-        };
-        updateState({
-          error: messages[err.code] || `Video error (code ${err.code})`,
-          isLoading: false,
-        });
-      }
+      if (!err) return;
+      const map: Record<number, string> = {
+        1: 'Playback aborted.',
+        2: 'Network error while loading media.',
+        3: 'Media decoding failed.',
+        4: 'Stream format unsupported or URL has expired.',
+      };
+      updateState({ error: map[err.code] || `Video error (code ${err.code})`, isLoading: false });
     };
 
     video.addEventListener('timeupdate', onTimeUpdate);

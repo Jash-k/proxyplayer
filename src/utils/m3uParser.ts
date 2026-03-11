@@ -3,7 +3,7 @@ import { Channel } from '../types/channel';
 const TAMIL_KEYWORDS = [
   'tamil', 'vijay', 'sun tv', 'sun music', 'kalaignar',
   'jaya', 'vendhar', 'polimer', 'puthiya', 'captain', 'zee tamil',
-  'colors tamil', 'raj tv', 'star vijay', 'star suvarna', 'isai',
+  'colors tamil', 'raj tv', 'star vijay', 'isai',
   'adithya', 'tamilan', 'tamilanda', 'raj musix', 'sun life',
   'kstv', 'jaya max', 'jaya plus', 'thirai',
 ];
@@ -19,74 +19,142 @@ export function isTamilChannel(name: string, group: string): boolean {
 }
 
 export function detectStreamType(url: string): 'hls' | 'dash' | 'mpd' {
-  // Strip query params and VLC-style pipe params before detecting
+  // Strip query params and pipe params before detecting
   const cleanUrl = url.split('|')[0].split('?')[0].toLowerCase();
-  if (cleanUrl.endsWith('.mpd') || cleanUrl.includes('/manifest.mpd') || cleanUrl.includes('.mpd?')) return 'dash';
-  if (cleanUrl.endsWith('.m3u8') || cleanUrl.includes('.m3u8')) return 'hls';
-  if (cleanUrl.includes('/dash/') || cleanUrl.includes('manifest.mpd')) return 'dash';
-  // Check full URL (with query)
-  const fullLower = url.split('|')[0].toLowerCase();
-  if (fullLower.includes('.mpd')) return 'dash';
-  if (fullLower.includes('.m3u8')) return 'hls';
+  if (cleanUrl.endsWith('.mpd')) return 'dash';
+  if (cleanUrl.endsWith('.m3u8')) return 'hls';
+  // Check with query string too
+  const withQuery = url.split('|')[0].toLowerCase();
+  if (withQuery.includes('.mpd')) return 'dash';
+  if (withQuery.includes('.m3u8')) return 'hls';
+  if (withQuery.includes('/dash/') || withQuery.includes('manifest.mpd')) return 'dash';
   return 'hls';
 }
 
 /**
- * Some M3U entries encode HTTP headers directly in the URL after a pipe `|`:
- * https://example.com/stream.m3u8|Cookie=abc&User-Agent=xyz&Referer=https://...
- * This function splits them out.
+ * Parse VLC-style pipe-delimited headers from a stream URL.
+ *
+ * Formats seen in the wild:
+ *   1. URL|Cookie=xxx&User-Agent=yyy
+ *      e.g. https://example.com/stream.m3u8|Cookie=abc&User-Agent=xyz
+ *
+ *   2. URL?|Cookie=xxx&User-Agent=yyy   (pipe right after ?)
+ *      e.g. https://example.com/stream.mpd?|Cookie=abc&User-Agent=xyz
+ *
+ *   3. URL?realParam=val|Cookie=xxx&User-Agent=yyy
+ *
+ *   4. URL?%7CCookie=...  (pipe URL-encoded as %7C — same as case 2 but encoded)
+ *
+ *   5. URL?realParam=val%7CCookie=xxx   (encoded pipe mid query-string)
+ *
+ * We also parse headers embedded as URL query params with the format:
+ *   %7CCookie=val&User-agent=val&Origin=val&Referer=val
+ * This is what Hotstar M3U entries look like.
  */
-function extractUrlAndPipeHeaders(rawUrl: string): {
+function extractUrlAndPipeHeaders(rawLine: string): {
   cleanUrl: string;
   pipeUserAgent?: string;
   pipeCookie?: string;
   pipeReferer?: string;
   pipeOrigin?: string;
 } {
-  const pipeIdx = rawUrl.indexOf('|');
-  if (pipeIdx === -1) return { cleanUrl: rawUrl };
+  // First fully decode the URL so we can work with it uniformly
+  let decoded = rawLine;
+  try {
+    // Decode once — handles %7C -> |, %252f -> %2f, etc.
+    decoded = decodeURIComponent(rawLine);
+  } catch {
+    decoded = rawLine;
+  }
 
-  const cleanUrl = rawUrl.substring(0, pipeIdx);
-  const paramStr = rawUrl.substring(pipeIdx + 1);
+  // Now find where the pipe separator is
+  // It can be:  ?|Cookie=   or   |Cookie=   or   ?realparam=val|Cookie=
+  let baseUrl = decoded;
+  let paramStr = '';
 
-  // Parse pipe params — they are like Cookie=...&User-Agent=...
+  // Case: pipe exists literally in the decoded string
+  const pipeIdx = decoded.indexOf('|');
+  if (pipeIdx !== -1) {
+    baseUrl = decoded.substring(0, pipeIdx);
+    paramStr = decoded.substring(pipeIdx + 1);
+
+    // If the pipe was right after '?', strip the '?' from baseUrl
+    if (baseUrl.endsWith('?')) {
+      baseUrl = baseUrl.slice(0, -1);
+    }
+  }
+
+  if (!paramStr) {
+    return { cleanUrl: baseUrl };
+  }
+
   const result: {
     cleanUrl: string;
     pipeUserAgent?: string;
     pipeCookie?: string;
     pipeReferer?: string;
     pipeOrigin?: string;
-  } = { cleanUrl };
+  } = { cleanUrl: baseUrl };
 
-  // We cannot use URLSearchParams directly because Cookie values often contain = signs
-  // and the values are not encoded. Parse manually.
-  const pairs = paramStr.split('&');
-  let i = 0;
-  while (i < pairs.length) {
-    const eqIdx = pairs[i].indexOf('=');
-    if (eqIdx === -1) { i++; continue; }
-    const key = pairs[i].substring(0, eqIdx).trim();
-    let value = pairs[i].substring(eqIdx + 1);
+  // Parse the pipe params — format: Key=value&Key2=value2
+  // Keys are case-insensitive: Cookie, User-Agent, User-agent, Referer, Origin
+  // Values may contain '=' (especially Cookie). We parse by known key names.
+  // Split on & but only when the next segment starts with a known key=
+  // We do a regex split approach
+  const keyPattern = /(?:^|&)(cookie|user-agent|referer|origin|connection|accept)=/gi;
+  
+  // Find all key positions
+  const keyPositions: Array<{ key: string; valueStart: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = keyPattern.exec(paramStr)) !== null) {
+    keyPositions.push({
+      key: m[1].toLowerCase(),
+      valueStart: m.index + m[0].length,
+    });
+  }
 
-    // For Cookie especially, values may span multiple &-delimited segments if they
-    // contain raw = signs. We greedily collect until we hit a known next key.
-    const knownKeys = ['Cookie', 'User-Agent', 'User-agent', 'Referer', 'Origin', 'Connection'];
-    let j = i + 1;
-    while (j < pairs.length) {
-      const nextEq = pairs[j].indexOf('=');
-      if (nextEq === -1) { value += '&' + pairs[j]; j++; continue; }
-      const nextKey = pairs[j].substring(0, nextEq).trim();
-      if (knownKeys.includes(nextKey)) break;
-      value += '&' + pairs[j];
-      j++;
+  for (let i = 0; i < keyPositions.length; i++) {
+    const { key, valueStart } = keyPositions[i];
+    
+    // Re-extract accurately: find the actual & before next known key
+    let value = paramStr.substring(valueStart);
+    if (i + 1 < keyPositions.length) {
+      // Find the right cut: next occurrence of &knownkey=
+      let found = -1;
+      for (let ni = i + 1; ni < keyPositions.length; ni++) {
+        const candidate = paramStr.lastIndexOf('&', keyPositions[ni].valueStart - 1);
+        if (candidate >= valueStart) {
+          if (found === -1 || candidate < found) found = candidate;
+        }
+      }
+      if (found !== -1) {
+        value = paramStr.substring(valueStart, found);
+      }
     }
-    i = j;
 
-    const keyLower = key.toLowerCase();
-    if (keyLower === 'cookie') result.pipeCookie = value;
-    else if (keyLower === 'user-agent') result.pipeUserAgent = value;
-    else if (keyLower === 'referer') result.pipeReferer = value;
-    else if (keyLower === 'origin') result.pipeOrigin = value;
+    // URL-decode the value
+    let decodedValue = value;
+    try { decodedValue = decodeURIComponent(value.replace(/\+/g, ' ')); } catch { /* keep raw */ }
+
+    if (key === 'cookie') result.pipeCookie = decodedValue;
+    else if (key === 'user-agent') result.pipeUserAgent = decodedValue;
+    else if (key === 'referer') result.pipeReferer = decodedValue;
+    else if (key === 'origin') result.pipeOrigin = decodedValue;
+  }
+
+  // Fallback: if regex approach got nothing, try simple split
+  if (!result.pipeCookie && !result.pipeUserAgent && !result.pipeReferer) {
+    const simplePairs = paramStr.split('&');
+    for (const pair of simplePairs) {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx === -1) continue;
+      const k = pair.substring(0, eqIdx).toLowerCase().trim();
+      const v = pair.substring(eqIdx + 1);
+      if (k === 'cookie') result.pipeCookie = v;
+      else if (k === 'user-agent') result.pipeUserAgent = v;
+      else if (k === 'referer') result.pipeReferer = v;
+      else if (k === 'origin') result.pipeOrigin = v;
+    }
   }
 
   return result;
@@ -102,7 +170,6 @@ function parseClearKey(licenseKey: string): { keyId: string; key: string } | nul
 }
 
 export function parseM3U(content: string): Channel[] {
-  // Normalize line endings and split
   const lines = content
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
@@ -115,7 +182,7 @@ export function parseM3U(content: string): Channel[] {
   while (i < lines.length) {
     const line = lines[i].trim();
 
-    // Skip header and empty lines
+    // Skip header, empty, and EXT-X lines
     if (!line || line.startsWith('#EXTM3U') || line.startsWith('#EXT-X-')) {
       i++;
       continue;
@@ -125,33 +192,32 @@ export function parseM3U(content: string): Channel[] {
       channelCounter++;
       const channel: Partial<Channel> = {};
 
-      // ── Parse EXTINF attributes ──────────────────────────────────────────
+      // Parse EXTINF attributes
       const tvgIdMatch = line.match(/tvg-id="([^"]*)"/);
       const tvgLogoMatch = line.match(/tvg-logo="([^"]*)"/);
       const groupMatch = line.match(/group-title="([^"]*)"/);
 
-      // Channel name is everything after the last comma
       const commaIdx = line.lastIndexOf(',');
       const name = commaIdx !== -1 ? line.substring(commaIdx + 1).trim() : 'Unknown Channel';
 
-      channel.id = tvgIdMatch ? tvgIdMatch[1] : `ch-${channelCounter}`;
-      channel.logo = tvgLogoMatch ? tvgLogoMatch[1] : '';
-      channel.group = groupMatch ? groupMatch[1].trim() : 'General';
+      channel.id = tvgIdMatch?.[1] || `ch-${channelCounter}`;
+      channel.logo = tvgLogoMatch?.[1] || '';
+      channel.group = groupMatch?.[1]?.trim() || 'General';
       channel.name = name || 'Unknown Channel';
 
       i++;
 
-      // ── Parse subsequent metadata lines until we hit a URL ───────────────
+      // Parse subsequent metadata lines until we hit a URL or next EXTINF
       while (i < lines.length) {
         const metaLine = lines[i].trim();
 
-        // A URL line starts with http(s)://
+        // URL line
         if (/^https?:\/\//i.test(metaLine)) break;
 
-        // Skip blank lines within a block
+        // Skip blank lines
         if (!metaLine) { i++; continue; }
 
-        // Skip next #EXTINF (malformed M3U where URL is missing)
+        // Next EXTINF = malformed block, skip
         if (metaLine.startsWith('#EXTINF')) break;
 
         // ClearKey license type
@@ -159,8 +225,7 @@ export function parseM3U(content: string): Channel[] {
           metaLine.startsWith('#KODIPROP:inputstream.adaptive.license_type=') ||
           metaLine.startsWith('#KODIPROP:inputstream.adaptive.stream_type=')
         ) {
-          const val = metaLine.split('=').slice(1).join('=').trim();
-          channel.licenseType = val;
+          channel.licenseType = metaLine.split('=').slice(1).join('=').trim();
         }
         // ClearKey license key
         else if (metaLine.startsWith('#KODIPROP:inputstream.adaptive.license_key=')) {
@@ -170,11 +235,11 @@ export function parseM3U(content: string): Channel[] {
         else if (metaLine.startsWith('#EXTVLCOPT:http-user-agent=')) {
           channel.userAgent = metaLine.replace('#EXTVLCOPT:http-user-agent=', '').trim();
         }
-        // Referrer
+        // Referrer via EXTVLCOPT
         else if (metaLine.startsWith('#EXTVLCOPT:http-referrer=')) {
           channel.referer = metaLine.replace('#EXTVLCOPT:http-referrer=', '').trim();
         }
-        // EXTHTTP JSON (cookie, user-agent, origin, etc.)
+        // EXTHTTP JSON
         else if (metaLine.startsWith('#EXTHTTP:')) {
           try {
             const jsonStr = metaLine.replace('#EXTHTTP:', '').trim();
@@ -197,7 +262,7 @@ export function parseM3U(content: string): Channel[] {
         i++;
       }
 
-      // ── The next line should be the URL ─────────────────────────────────
+      // The next line should be the stream URL
       if (i < lines.length && /^https?:\/\//i.test(lines[i].trim())) {
         const rawUrl = lines[i].trim();
         const { cleanUrl, pipeUserAgent, pipeCookie, pipeReferer, pipeOrigin } =
@@ -205,7 +270,7 @@ export function parseM3U(content: string): Channel[] {
 
         channel.url = cleanUrl;
 
-        // Pipe-extracted headers override/supplement existing ones
+        // Pipe-extracted headers fill in missing values (don't override #EXTHTTP/#EXTVLCOPT)
         if (pipeUserAgent && !channel.userAgent) channel.userAgent = pipeUserAgent;
         if (pipeCookie && !channel.cookie) channel.cookie = pipeCookie;
         if (pipeReferer && !channel.referer) channel.referer = pipeReferer;
@@ -214,15 +279,17 @@ export function parseM3U(content: string): Channel[] {
         channel.streamType = detectStreamType(cleanUrl);
         channel.isTamil = isTamilChannel(channel.name || '', channel.group || '');
 
-        // Parse ClearKey if present
+        // Parse ClearKey
         if (channel.licenseKey) {
           channel.clearKey = parseClearKey(channel.licenseKey) ?? undefined;
         }
 
-        channels.push(channel as Channel);
+        // Validate we have a usable URL
+        if (channel.url && channel.name) {
+          channels.push(channel as Channel);
+        }
         i++;
       }
-      // If no URL found, just continue (skip corrupt block)
     } else {
       i++;
     }
