@@ -1,11 +1,13 @@
 // index.js — PixelStream: Telegram Bot + Stremio Addon + Keep-Alive
 // Single process. Deploy as ONE Render Web Service.
-// node-telegram-bot-api  stremio-addon-sdk  @supabase/supabase-js
+// Deps: node-telegram-bot-api  stremio-addon-sdk  @supabase/supabase-js
 
-import TelegramBot from 'node-telegram-bot-api'
-import { addonBuilder, serveHTTP } from 'stremio-addon-sdk'
-import { createClient } from '@supabase/supabase-js'
-import http from 'http'
+'use strict'
+
+const { addonBuilder, serveHTTP } = require('stremio-addon-sdk')
+const { createClient }            = require('@supabase/supabase-js')
+const TelegramBot                 = require('node-telegram-bot-api')
+const http                        = require('http')
 
 // ── Clients ───────────────────────────────────────────────────────────────────
 const supabase = createClient(
@@ -26,13 +28,23 @@ function startKeepAlive() {
     console.log('[keep-alive] skipped — no RENDER_EXTERNAL_URL (ok for local)')
     return
   }
-  const target = url + '/ping'
+  const target = url.replace('https://', '') // http.get needs just host
+  const interval = 10 * 60 * 1000  // 10 minutes
+
   setInterval(() => {
-    http.get(target, res => {
+    const opts = {
+      hostname: target,
+      path: '/',
+      method: 'GET',
+    }
+    const req = http.request(opts, res => {
       console.log('[keep-alive] ping ->', res.statusCode)
-    }).on('error', e => console.error('[keep-alive] error:', e.message))
-  }, 10 * 60 * 1000)  // every 10 minutes
-  console.log('[keep-alive] started — pinging', target, 'every 10 min')
+    })
+    req.on('error', e => console.error('[keep-alive] error:', e.message))
+    req.end()
+  }, interval)
+
+  console.log('[keep-alive] started — pinging', url, 'every 10 min')
 }
 
 // ── Stremio Manifest ──────────────────────────────────────────────────────────
@@ -53,47 +65,50 @@ const manifest = {
 const builder = new addonBuilder(manifest)
 
 // ── Catalog Handler ───────────────────────────────────────────────────────────
-builder.defineCatalogHandler(async ({ type, id }) => {
+builder.defineCatalogHandler(async function({ type, id }) {
   if (type === 'movie' && id === 'pd-movies') {
     const { data } = await supabase
       .from('movies')
       .select('pixeldrain_id, title, year, genre, poster')
       .order('added_at', { ascending: false })
     return {
-      metas: (data || []).map(m => ({
-        id:          'pd_m:' + m.pixeldrain_id,
-        type:        'movie',
-        name:        m.title,
-        year:        m.year,
-        genres:      m.genre ? [m.genre] : [],
-        poster:      m.poster,
-        posterShape: 'poster',
-      }))
+      metas: (data || []).map(function(m) {
+        return {
+          id:          'pd_m:' + m.pixeldrain_id,
+          type:        'movie',
+          name:        m.title,
+          year:        m.year,
+          genres:      m.genre ? [m.genre] : [],
+          poster:      m.poster,
+          posterShape: 'poster',
+        }
+      })
     }
   }
 
   if (type === 'series' && id === 'pd-series') {
-    // Fetch all episodes, return one card per unique series_id
     const { data } = await supabase
       .from('episodes')
       .select('series_id, title, year, genre, poster')
       .order('added_at', { ascending: false })
     const seen   = new Set()
-    const unique = (data || []).filter(e => {
+    const unique = (data || []).filter(function(e) {
       if (seen.has(e.series_id)) return false
       seen.add(e.series_id)
       return true
     })
     return {
-      metas: unique.map(s => ({
-        id:          'pd_s:' + s.series_id,
-        type:        'series',
-        name:        s.title,
-        year:        s.year,
-        genres:      s.genre ? [s.genre] : [],
-        poster:      s.poster,
-        posterShape: 'poster',
-      }))
+      metas: unique.map(function(s) {
+        return {
+          id:          'pd_s:' + s.series_id,
+          type:        'series',
+          name:        s.title,
+          year:        s.year,
+          genres:      s.genre ? [s.genre] : [],
+          poster:      s.poster,
+          posterShape: 'poster',
+        }
+      })
     }
   }
 
@@ -101,7 +116,7 @@ builder.defineCatalogHandler(async ({ type, id }) => {
 })
 
 // ── Meta Handler ──────────────────────────────────────────────────────────────
-builder.defineMetaHandler(async ({ type, id }) => {
+builder.defineMetaHandler(async function({ type, id }) {
   if (type === 'movie' && id.startsWith('pd_m:')) {
     const pid      = id.replace('pd_m:', '')
     const { data } = await supabase
@@ -125,8 +140,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
       .from('episodes').select('*')
       .eq('series_id', sid)
       .order('season').order('episode')
-    if (!data?.length) return { meta: null }
-    const pad = n => String(n).padStart(2, '0')
+    if (!data || !data.length) return { meta: null }
+    function pad(n) { return String(n).padStart(2, '0') }
     return {
       meta: {
         id,
@@ -135,13 +150,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
         year:   data[0].year,
         genres: data[0].genre ? [data[0].genre] : [],
         poster: data[0].poster,
-        videos: data.map(ep => ({
-          id:       'pd_e:' + ep.pixeldrain_id,
-          title:    ep.episode_title || ('Episode ' + ep.episode),
-          season:   ep.season,
-          episode:  ep.episode,
-          released: new Date(ep.added_at).toISOString(),
-        }))
+        videos: data.map(function(ep) {
+          return {
+            id:       'pd_e:' + ep.pixeldrain_id,
+            title:    ep.episode_title || ('Episode ' + ep.episode),
+            season:   ep.season,
+            episode:  ep.episode,
+            released: new Date(ep.added_at).toISOString(),
+          }
+        })
       }
     }
   }
@@ -150,9 +167,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
 })
 
 // ── Stream Handler ────────────────────────────────────────────────────────────
-// id is always pd_m:<pixeldrain_id> or pd_e:<pixeldrain_id>
-builder.defineStreamHandler(async ({ id }) => {
-  let pid = null
+builder.defineStreamHandler(async function({ id }) {
+  var pid = null
   if (id.startsWith('pd_m:')) pid = id.replace('pd_m:', '')
   if (id.startsWith('pd_e:')) pid = id.replace('pd_e:', '')
   if (!pid) return { streams: [] }
@@ -166,13 +182,12 @@ builder.defineStreamHandler(async ({ id }) => {
 })
 
 // ── Start Addon HTTP Server ───────────────────────────────────────────────────
-// Render injects PORT automatically. stremio-addon-sdk serves on it.
 const PORT = parseInt(process.env.PORT) || 7000
 serveHTTP(builder.getInterface(), { port: PORT })
 console.log('[addon] Stremio addon running on port', PORT)
 
 // ── Telegram Bot Commands ─────────────────────────────────────────────────────
-bot.onText(/\/start/, msg => {
+bot.onText(/\/start/, function(msg) {
   bot.sendMessage(msg.chat.id,
     '👋 PixelStream Bot\n\n' +
     'Commands:\n' +
@@ -183,17 +198,17 @@ bot.onText(/\/start/, msg => {
   )
 })
 
-bot.onText(/\/addmovie/, msg => {
+bot.onText(/\/addmovie/, function(msg) {
   sessions[msg.chat.id] = { type: 'movie', step: 'url' }
   bot.sendMessage(msg.chat.id, '🎬 Send the Pixeldrain link:')
 })
 
-bot.onText(/\/addseries/, msg => {
+bot.onText(/\/addseries/, function(msg) {
   sessions[msg.chat.id] = { type: 'series', step: 'url' }
   bot.sendMessage(msg.chat.id, '📺 Send the Pixeldrain episode link:')
 })
 
-bot.on('message', async msg => {
+bot.on('message', async function(msg) {
   const chatId = msg.chat.id
   const text   = (msg.text || '').trim()
   const s      = sessions[chatId]
@@ -213,7 +228,7 @@ bot.on('message', async msg => {
         'Size: ' + (info.size / 1024 / 1024).toFixed(1) + ' MB\n\n' +
         'Send the title:'
       )
-    } catch {
+    } catch(e) {
       bot.sendMessage(chatId, '❌ Could not reach Pixeldrain. Try again.')
       delete sessions[chatId]
     }
@@ -303,7 +318,7 @@ async function saveMovie(chatId, s) {
 }
 
 async function saveEpisode(chatId, s) {
-  const pad      = n => String(n).padStart(2, '0')
+  function pad(n) { return String(n).padStart(2, '0') }
   const { error } = await supabase.from('episodes').insert({
     pixeldrain_id: s.pixeldrain_id,
     series_id:     s.series_id,
@@ -322,8 +337,8 @@ async function saveEpisode(chatId, s) {
 }
 
 // ── /list command ─────────────────────────────────────────────────────────────
-bot.onText(/\/list/, async msg => {
-  const pad = n => String(n).padStart(2, '0')
+bot.onText(/\/list/, async function(msg) {
+  function pad(n) { return String(n).padStart(2, '0') }
   const { data: movies } = await supabase
     .from('movies').select('title, year, pixeldrain_id')
     .order('added_at', { ascending: false }).limit(10)
@@ -332,18 +347,18 @@ bot.onText(/\/list/, async msg => {
     .order('added_at', { ascending: false }).limit(10)
 
   let out = '🎬 Recent Movies:\n'
-  ;(movies || []).forEach(m => {
+  ;(movies || []).forEach(function(m) {
     out += '  ' + m.title + ' (' + (m.year || '?') + ') — ' + m.pixeldrain_id + '\n'
   })
   out += '\n📺 Recent Episodes:\n'
-  ;(eps || []).forEach(e => {
+  ;(eps || []).forEach(function(e) {
     out += '  ' + e.title + ' S' + pad(e.season) + 'E' + pad(e.episode) + ' — ' + e.pixeldrain_id + '\n'
   })
   bot.sendMessage(msg.chat.id, out || 'Nothing added yet.')
 })
 
 // ── /delete command ───────────────────────────────────────────────────────────
-bot.onText(/\/delete (.+)/, async (msg, match) => {
+bot.onText(/\/delete (.+)/, async function(msg, match) {
   const pid = match[1].trim()
   await supabase.from('movies').delete().eq('pixeldrain_id', pid)
   await supabase.from('episodes').delete().eq('pixeldrain_id', pid)
