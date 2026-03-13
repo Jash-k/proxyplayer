@@ -9,13 +9,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@types/react-syntax-highlighter": "^15.5.13",
     "clsx": "2.1.1",
-    "dashjs": "^5.1.1",
-    "hls.js": "^1.6.15",
     "lucide-react": "^0.577.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "shaka-player": "^5.0.5",
+    "react-hot-toast": "^2.6.0",
+    "react-router-dom": "^7.13.1",
+    "react-syntax-highlighter": "^16.1.1",
     "tailwind-merge": "3.4.0"
   },
   "devDependencies": {
