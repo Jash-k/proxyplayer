@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pixelstream
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /ping
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
